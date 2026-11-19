@@ -7,13 +7,15 @@
 #   .\Find-duplicated-files.ps1                           # pick folders with a dialog
 #   .\Find-duplicated-files.ps1 -Folders 'D:\A','D:\B'    # skip the dialog
 #   .\Find-duplicated-files.ps1 -IncludeHidden            # also scan hidden files/folders
+#   .\Find-duplicated-files.ps1 -CsvReports               # also save CSV reports
 #   pwsh .\Find-duplicated-files.ps1                      # run with PowerShell 7
 #
 # Always skipped: empty (0-byte) files, files/folders with the System attribute,
 # symlinks/junctions, and network locations.
-# CSV reports are written to the folder that contains this script. They use
-# your Windows list separator (e.g. ';' on German systems) so Excel opens them
-# directly. You can delete rows from Proposed-Deletions-*.csv to keep files.
+# Results are shown in grid windows (Out-GridView), where you can sort, filter
+# and select the files to recycle. With -CsvReports, CSV copies are also
+# written to the folder that contains this script, using your Windows list
+# separator (e.g. ';' on German systems) so Excel opens them directly.
 #
 # Folder order matters: when a copy must be kept from folders being cleaned,
 # the copy in the lowest-numbered folder is kept.
@@ -24,10 +26,17 @@ param(
     [string[]]$Folders = @(),
 
     # Include hidden files and folders. If not given, you are asked (default: No).
-    [switch]$IncludeHidden
+    [switch]$IncludeHidden,
+
+    # Also save the results as CSV files next to this script.
+    [switch]$CsvReports
 )
 
 $ErrorActionPreference = 'Stop'
+
+if (-not (Get-Command Out-GridView -ErrorAction SilentlyContinue)) {
+    throw 'Out-GridView is not available. Use Windows PowerShell 5.1 or PowerShell 7 on Windows (not Server Core).'
+}
 
 # Files at least this big are first compared by a quick hash of their first
 # and last 64 KB; only files that still match are fully hashed.
@@ -189,6 +198,7 @@ function Show-Progress([string]$activity, [int]$done, [int]$total) {
 }
 
 function Save-Csv($data, [string]$path) {
+    if (-not $CsvReports) { return }
     $options = @{ LiteralPath = $path; Encoding = $csvEncoding; UseCulture = $true }
     # Needed in 5.1; obsolete (and the default) in PowerShell 7.
     if ($PSVersionTable.PSVersion.Major -lt 6) { $options['NoTypeInformation'] = $true }
@@ -267,7 +277,7 @@ for ($i = 0; $i -lt $normalized.Count; $i++) {
 $hiddenText = if ($includeHiddenFiles) { 'included' } else { 'skipped' }
 Write-Host "Hidden files/folders: $hiddenText. System files, empty files and symlinks: skipped."
 
-# CSV reports go next to this script (or the current folder if run without a file).
+# Optional CSV reports go next to this script (or the current folder if run without a file).
 $reportDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).ProviderPath }
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 
@@ -283,6 +293,8 @@ for ($i = 0; $i -lt $normalized.Count; $i++) {
             FolderNumber = $i + 1
             Path = $f.FullName
             Size = [long]$f.Length
+            Created = $f.CreationTime
+            Modified = $f.LastWriteTime
         })
     }
 }
@@ -333,6 +345,8 @@ for ($n = 0; $n -lt $toHash.Count; $n++) {
             FolderNumber = $f.FolderNumber
             Path = $f.Path
             Size = $f.Size
+            Created = $f.Created
+            Modified = $f.Modified
             SHA256 = $digest
             GroupKey = "$($f.Size):$digest"
         })
@@ -358,7 +372,10 @@ $rows = @(
                 DuplicateGroup = $i + 1
                 FolderNumber = $file.FolderNumber
                 FilePath = $file.Path
+                SizeMB = [math]::Round($file.Size / 1MB, 2)
                 SizeBytes = $file.Size
+                Created = $file.Created
+                Modified = $file.Modified
                 SHA256 = $file.SHA256
             }
         }
@@ -366,28 +383,37 @@ $rows = @(
 )
 Save-Csv $rows $allReport
 Write-Host "`nFound $($groups.Count) duplicate groups ($($rows.Count) files)." -ForegroundColor Green
-Write-Host "Full report: $allReport"
+if ($CsvReports) { Write-Host "Full report: $allReport" }
+Write-Host 'Review all duplicates in the window that opened, then click OK to continue.'
+# -PassThru only adds the OK/Cancel buttons and waits; the selection is ignored.
+# Both buttons continue (Out-GridView cannot tell them apart); the next window has its own Cancel.
+$null = $rows | Out-GridView -PassThru -Title "All duplicates: $($groups.Count) groups, $($rows.Count) files (click OK to continue)"
 
 # ---------------------------------------------------------------------------
 # 5. Choose which folders to clean
 # ---------------------------------------------------------------------------
-Write-Host "`nWhich folders should be CLEANED? (All other folders stay untouched.)" -ForegroundColor Cyan
-Write-Host 'If every copy is in folders being cleaned, the copy in the lowest-numbered folder is kept.'
-for ($i = 0; $i -lt $normalized.Count; $i++) {
-    Write-Host (" {0,2}. {1}" -f ($i + 1), $normalized[$i])
-}
-$selection = Read-Host 'Enter folder numbers separated by commas (e.g. 2,4), or Enter to exit'
-if ([string]::IsNullOrWhiteSpace($selection)) { return }
-$tokens = @($selection -split '[,;\s]+' | Where-Object { $_ })
-$selected = [Collections.Generic.HashSet[int]]::new()
-foreach ($token in $tokens) {
-    $number = 0
-    if (-not [int]::TryParse($token, [ref]$number) -or
-        $number -lt 1 -or $number -gt $normalized.Count) {
-        throw "Invalid folder number: $token"
+Write-Host "`nSelect the folders to CLEAN in the window that opened (Ctrl+click for several), then click OK." -ForegroundColor Cyan
+Write-Host 'All other folders stay untouched. If every copy is in folders being cleaned, the copy in the lowest-numbered folder is kept.'
+$folderRows = @(
+    for ($i = 0; $i -lt $normalized.Count; $i++) {
+        $number = $i + 1
+        [pscustomobject]@{
+            FolderNumber = $number
+            Folder = $normalized[$i]
+            DuplicateFiles = @($rows | Where-Object { $_.FolderNumber -eq $number }).Count
+        }
     }
-    [void]$selected.Add($number)
+)
+$pickedFolders = @($folderRows |
+    Out-GridView -PassThru -Title 'Select the folders to CLEAN, then click OK (Cancel = exit)')
+if ($pickedFolders.Count -eq 0) {
+    Write-Host 'No folders selected. No files deleted.'
+    return
 }
+$selected = [Collections.Generic.HashSet[int]]::new()
+foreach ($f in $pickedFolders) { [void]$selected.Add([int]$f.FolderNumber) }
+Write-Host 'Folders to clean:'
+foreach ($f in $pickedFolders) { Write-Host (" {0,2}. {1}" -f $f.FolderNumber, $f.Folder) }
 
 # ---------------------------------------------------------------------------
 # 6. Decide what to keep. All copies in unselected folders are kept. If a
@@ -406,6 +432,7 @@ for ($i = 0; $i -lt $groups.Count; $i++) {
                 FolderNumber = $f.FolderNumber
                 FileToRecycle = $f.Path
                 KeptMatchingCopy = $keeper.Path
+                SizeMB = [math]::Round($f.Size / 1MB, 2)
                 SizeBytes = $f.Size
                 SHA256 = $f.SHA256
             })
@@ -420,51 +447,42 @@ if ($candidates.Count -eq 0) {
 $deleteReport = Join-Path $reportDir "Proposed-Deletions-$stamp.csv"
 Save-Csv $candidates $deleteReport
 $sum = ($candidates | Measure-Object -Property SizeBytes -Sum).Sum
-Write-Host "`nPREVIEW: $($candidates.Count) files would be recycled ($([math]::Round($sum / 1GB, 2)) GB)." -ForegroundColor Yellow
-Write-Host "Review this CSV BEFORE continuing: $deleteReport"
-Write-Host 'To KEEP a file, delete its row from the CSV and save it (same name, CSV format).'
-Write-Host 'Rows can only be removed; anything not in the original preview is ignored.'
+Write-Host "`nPREVIEW: $($candidates.Count) files could be recycled ($([math]::Round($sum / 1GB, 2)) GB)." -ForegroundColor Yellow
+if ($CsvReports) { Write-Host "Preview report: $deleteReport" }
+Write-Host 'In the window that opened, SELECT the files to recycle (Ctrl+A = all), then click OK.'
+Write-Host 'Files you do not select are kept. Cancel = exit without deleting anything.'
 Write-Host 'At least one matching copy of each duplicate group will be retained.'
 Write-Host 'Unique files are never selected. Unselected folders are never changed.'
 Write-Host 'If a file cannot go to the Recycle Bin, Windows asks before deleting it permanently.'
 
-# Re-read the (possibly edited) CSV. Only rows that match the original preview
-# are used, and all details come from the scan, never from the edited file.
+# Map the selected grid rows back to the scan results by path, so all details
+# used for recycling come from the scan.
 $candidateByPath = @{}   # PowerShell hashtables ignore case
 foreach ($c in $candidates) { $candidateByPath[$c.FileToRecycle] = $c }
 
-while ($true) {
-    $confirmation = Read-Host 'Move the files listed in the CSV to the Recycle Bin? [y/N]'
-    if ($confirmation -notmatch '^\s*[Yy]') {   # Enter (empty) means No
-        Write-Host 'Cancelled. No files deleted.'
-        return
-    }
-    try {
-        $editedRows = @(Import-Csv -LiteralPath $deleteReport -UseCulture -ErrorAction Stop)
-        break
-    }
-    catch {
-        Write-Warning "Could not read the CSV: $($_.Exception.Message)"
-        Write-Warning 'If it is open in Excel, close it and try again.'
-    }
-}
+$pickedRows = @($candidates |
+    Out-GridView -PassThru -Title "Select files to RECYCLE (Ctrl+A = all), then click OK. $($candidates.Count) candidates")
 
 $approved = [Collections.Generic.List[object]]::new()
 $approvedPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-foreach ($row in $editedRows) {
+foreach ($row in $pickedRows) {
     $path = $row.FileToRecycle
-    if ([string]::IsNullOrWhiteSpace($path) -or -not $candidateByPath.ContainsKey($path)) {
-        Write-Warning "Ignored a CSV row that is not in the original preview: '$path'"
-        continue
+    if ($path -and $candidateByPath.ContainsKey($path) -and $approvedPaths.Add($path)) {
+        $approved.Add($candidateByPath[$path])
     }
-    if ($approvedPaths.Add($path)) { $approved.Add($candidateByPath[$path]) }
+}
+if ($approved.Count -eq 0) {
+    Write-Host 'No files selected. No files deleted.'
+    return
 }
 $keptByUser = $candidates.Count - $approved.Count
 if ($keptByUser -gt 0) {
-    Write-Host "$keptByUser files were removed from the list and will be kept." -ForegroundColor Cyan
+    Write-Host "$keptByUser files were not selected and will be kept." -ForegroundColor Cyan
 }
-if ($approved.Count -eq 0) {
-    Write-Host 'Nothing left to recycle. No files deleted.'
+$approvedSum = ($approved | Measure-Object -Property SizeBytes -Sum).Sum
+$confirmation = Read-Host "Move $($approved.Count) selected files ($([math]::Round($approvedSum / 1GB, 2)) GB) to the Recycle Bin? [y/N]"
+if ($confirmation -notmatch '^\s*[Yy]') {   # Enter (empty) means No
+    Write-Host 'Cancelled. No files deleted.'
     return
 }
 Write-Host "Recycling $($approved.Count) files..."
@@ -505,6 +523,7 @@ foreach ($item in $approved) {
         Reason = $reason
         FileToRecycle = $item.FileToRecycle
         KeptMatchingCopy = $item.KeptMatchingCopy
+        SizeMB = $item.SizeMB
         SizeBytes = $item.SizeBytes
     })
 }
@@ -512,4 +531,6 @@ foreach ($item in $approved) {
 $resultReport = Join-Path $reportDir "Recycle-Results-$stamp.csv"
 Save-Csv $results $resultReport
 Write-Host "`nFinished: $recycled files recycled; $skipped skipped." -ForegroundColor Green
-Write-Host "Results report: $resultReport"
+if ($CsvReports) { Write-Host "Results report: $resultReport" }
+Write-Host 'Close the results window to finish.'
+$results | Out-GridView -Wait -Title "Results: $recycled recycled, $skipped skipped (close this window to finish)"
